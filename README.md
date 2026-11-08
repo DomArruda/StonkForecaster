@@ -14,11 +14,21 @@ python -m uv run streamlit run app.py
    Expand **Portfolio settings** to choose trading rules, starting investment, and trading costs.
 2. **Forecast comparison:** choose a stock. All selected models share one chart with actual prices
    and a yesterday's-close baseline. The accuracy table shows price error and correct up/down predictions.
-   Use the dropdown to switch between test-day predictions and future forecasts.
+   Use the dropdown to switch between test-day predictions and future forecasts. Enable
+   **Show training history and extend the model lines from it** to see the entire history and model
+   lines connected to the final training close. Training and future boundaries are marked on the chart.
+   Expand **Model equations** to see each fitted model: the price equation for linear, ridge, and lasso,
+   the highest-gain XGBoost tree, and the neural-network architecture.
 3. **Portfolio strategies:** each model manages the same equal-starting-allocation portfolio using
-   each stock's own forecast. Compare returns against buy & hold; choose a trading rule for the graph.
-   Rank model/rule combinations by return, risk-adjusted return, or biggest fall from a peak.
-4. Expand the full portfolio comparison to see every combination or download a CSV.
+   each stock's own forecast. Compare returns against buy & hold; **Strategy to explore** explains
+   the selected rule in plain language and displays its results for all models.
+4. The portfolio comparison lists every model/rule combination once; download it as a CSV.
+   **Advanced: how each stock contributed** decomposes a chosen model's portfolio return into
+   per-stock contributions (percentage points) and compares each with buy & hold. Contributions
+   sum to the portfolio return because every stock starts with an equal share.
+
+Charts use Plotly: drag or scroll to zoom, pan with the toolbar, or adjust the date slider.
+Double-click to reset the view; click a legend entry to hide a line, or double-click it to isolate one.
 
 Every model uses the five preceding observed closes and the same chronological test dates.
 Predictions for a session target its close using earlier observations. Future forecasts are refitted
@@ -26,6 +36,8 @@ on all available history, then repeat next-day predictions using their own predi
 has equal starting allocations; the modeled trade cost also applies to buy & hold's initial purchase.
 “Best” means best on the displayed test period under the selected ranking criterion.
 Future dates use weekdays and do not exclude exchange holidays.
+The training-history join is a visual anchor, not an additional scored prediction. Test-day forecasts
+still use observed prices from preceding days; future forecasts use their own preceding predictions.
 
 ## Verify the calculations and UI
 

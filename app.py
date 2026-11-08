@@ -2,6 +2,7 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 import yfinance as yf
 from sklearn.linear_model import Lasso, LinearRegression, Ridge
@@ -21,6 +22,22 @@ STRATEGIES = {
     "Buy rises / sell falls": lambda r: np.where(r > 0, 1.0, np.where(r < 0, 0.0, np.nan)),
     "Buy dips / sell rallies": lambda r: np.where(r < 0, 1.0, np.where(r > 0, 0.0, np.nan)),
     "Buy rises / short falls": lambda r: np.where(r > 0, 1.0, np.where(r < 0, -1.0, np.nan)),
+}
+STRATEGY_EXPLANATIONS = {
+    "Buy rises / sell falls": (
+        "**Follow the forecast.** Buy or keep the stock when the model predicts a next-day price above the latest close. "
+        "Sell into cash when it predicts a lower price. Cash earns 0% in this comparison."
+    ),
+    "Buy dips / sell rallies": (
+        "**Go against the forecast (contrarian).** Buy when the model predicts a lower next-day price; "
+        "sell into cash when it predicts a higher price. This deliberately trades against the model's predicted direction, "
+        "rather than buying at an observed future low."
+    ),
+    "Buy rises / short falls": (
+        "**Follow the forecast with shorting.** Buy when the model predicts a higher next-day price and "
+        "short when it predicts a lower price. Shorting means betting on a price fall: gains when the stock falls, "
+        "losses when it rises. Short-borrow and margin costs are excluded here."
+    ),
 }
 RANK_BY = {
     "Return above buy & hold": ("Vs holding (pp)", False),
@@ -101,7 +118,12 @@ def compute_results(close, models, steps, split):
         values = forecast_next_days(pipe, ys, close, steps)
         if not np.isfinite(test).all() or not np.isfinite(values).all():
             raise ValueError(f"{name} produced a non-finite forecast. Try a shorter horizon.")
-        results[name] = {"test": test, "future": pd.Series(values, index=future, name=name)}
+        results[name] = {
+            "test": test,
+            "future": pd.Series(values, index=future, name=name),
+            "model": pipe,
+            "y_scaler": ys,
+        }
     return results
 
 
@@ -173,9 +195,10 @@ def analyze(closes, models, strategies, steps, split, cost_bps, capital):
         ).reset_index(drop=True)
         for t in prices
     }
-    curves, rows = {}, []
+    curves, stock_curves, rows = {}, {}, []
     for strategy in strategies:
         equities = {t: strategy_equity(prices[t], forecasts[t], STRATEGIES[strategy], cost_bps) for t in prices}
+        stock_curves[strategy] = equities
         equity = portfolio_equity(equities)
         curves[strategy] = equity
         holding = performance_stats(equity["Buy & hold"])["Net return (%)"]
@@ -188,7 +211,8 @@ def analyze(closes, models, strategies, steps, split, cost_bps, capital):
     naive_errors = {t: prediction_stats(prices[t], prices[t].shift(1).loc[dates])["Forecast error (%)"]
                     for t in prices}
     return {
-        "prices": prices, "forecasts": forecasts, "accuracy": accuracy, "curves": curves,
+        "prices": prices, "forecasts": forecasts, "accuracy": accuracy,
+        "curves": curves, "stock_curves": stock_curves,
         "comparisons": pd.DataFrame(rows),
         "test_dates": dates, "naive_errors": naive_errors,
         "capital": capital, "cost_bps": cost_bps, "models": list(models),
@@ -205,23 +229,89 @@ def rank_combinations(comparisons, criterion):
     return ranked
 
 
-def forecast_lines(analysis, stock, models, include_future=False):
+def forecast_lines(analysis, stock, models, include_future=False, include_training=False):
     prices = analysis["prices"]
     dates = analysis["test_dates"]
     actual = prices[stock].rename("Actual")
+    training_end = prices.index[prices.index.get_loc(dates[0]) - 1]
+    anchor = pd.Series(actual.loc[training_end], index=[training_end])
     naive = actual.shift(1).loc[dates]
     lines = [actual]
     for model in models:
         result = analysis["forecasts"][stock][model]
         values = pd.concat([result["test"], result["future"]]) if include_future else result["test"]
+        if include_training:
+            values = pd.concat([anchor, values])
         lines.append(values.rename(model))
     if include_future:
         future = analysis["forecasts"][stock][models[0]]["future"].index
         naive = pd.concat([naive, pd.Series(actual.iloc[-1], index=future)])
+    if include_training:
+        naive = pd.concat([anchor, naive])
     lines.append(naive.rename("Yesterday's close baseline"))
     frame = pd.concat(lines, axis=1).sort_index()
     frame.index.name = "Date"
+    if include_training:
+        return frame
     return frame.loc[prices.index[max(0, len(prices) - 20)]:] if include_future else frame.loc[dates]
+
+
+def line_figure(frame, y_label):
+    data = frame.reset_index()
+    figure = px.line(data, x=data.columns[0], y=list(frame.columns), labels={"value": y_label, "variable": ""})
+    figure.update_layout(hovermode="x unified", dragmode="zoom", legend_title_text="", height=520)
+    figure.update_xaxes(title_text="Date", rangeslider_visible=True)
+    return figure
+
+
+def linear_equation(result):
+    pipe, y_scaler = result["model"], result["y_scaler"]
+    estimator, x_scaler = pipe[-1], pipe[0]
+    coefficients = estimator.coef_ * y_scaler.scale_[0] / x_scaler.scale_
+    intercept = (y_scaler.mean_[0] + y_scaler.scale_[0] * float(estimator.intercept_)
+                 - float(np.sum(coefficients * x_scaler.mean_)))
+    return float(intercept), coefficients
+
+
+def equation_latex(intercept, coefficients):
+    terms = [f"{intercept:.2f}"]
+    for i, coefficient in enumerate(coefficients, start=1):
+        terms.append(f"{'+' if coefficient >= 0 else '-'} {abs(coefficient):.4f}\\,lag_{i}")
+    return r"\text{price}_t = " + " ".join(terms)
+
+
+def show_equations(analysis, stock):
+    with st.expander("Model equations (fitted on all available history)"):
+        st.caption("Coefficients are converted back to original price units. The final refit produces the future forecasts; "
+                   "test-day accuracy uses the earlier training fit. lag_1 is yesterday's close; lag_5 is five sessions ago.")
+        for model in analysis["models"]:
+            result = analysis["forecasts"][stock][model]
+            estimator = result["model"][-1]
+            st.markdown(f"**{model}**")
+            if model in ("Linear Regression", "Ridge Regression", "Lasso Regression"):
+                st.latex(equation_latex(*linear_equation(result)))
+                if model == "Linear Regression":
+                    st.caption("Ordinary least squares: minimizes squared error.")
+                else:
+                    penalty = "L2" if model == "Ridge Regression" else "L1"
+                    st.caption(f"{penalty} penalty with alpha = {estimator.alpha:g}, applied to standardized inputs.")
+            elif model == "XGBoost":
+                trees = estimator.get_booster().trees_to_dataframe()
+                gains = trees.groupby("Tree")["Gain"].sum()
+                best = int(gains.idxmax())
+                st.caption(f"Ensemble of {len(gains)} trees. Predictions add every tree's output plus a base score. "
+                           f"Shown: the highest-total-gain tree (tree {best + 1}). "
+                           "Features are lag_1 (yesterday's close) through lag_5.")
+                tree = trees[trees["Tree"] == best].drop(columns="Tree")
+                tree["Feature"] = tree["Feature"].replace({f"f{i}": f"lag_{i + 1}" for i in range(LAGS)})
+                st.dataframe(tree, hide_index=True, width="stretch")
+            else:
+                layers = [estimator.n_features_in_, *estimator.hidden_layer_sizes, 1]
+                parameters = sum(w.size for w in estimator.coefs_) + sum(b.size for b in estimator.intercepts_)
+                hidden = " → ".join(f"{n} hidden units" for n in layers[1:-1])
+                st.markdown(f"Input: {layers[0]} lagged prices → {hidden} → output: 1 price. "
+                            f"Activation: {estimator.activation}. {parameters:,} fitted weights and biases.")
+                st.caption("A neural network has no compact closed-form equation; the fitted weights define the mapping.")
 
 
 def show_comparisons(ranked):
@@ -254,8 +344,25 @@ def show_forecasts(analysis):
     if naive_error < accuracy["Forecast error (%)"].min():
         st.info("Predicting the same price as yesterday had a lower price error than every model on these test days.")
 
-    frame = forecast_lines(analysis, stock, analysis["models"], include_future=view == "Future forecasts")
-    st.line_chart(frame, y_label="Adjusted closing price")
+    include_training = st.checkbox("Show training history and extend the model lines from it", key="show_training")
+    frame = forecast_lines(analysis, stock, analysis["models"], include_future=view == "Future forecasts",
+                           include_training=include_training)
+    figure = line_figure(frame, "Adjusted closing price")
+    for model in analysis["models"]:
+        figure.update_traces(line_dash="dash", selector={"name": model})
+    prices = analysis["prices"]
+    training_end = prices.index[prices.index.get_loc(analysis["test_dates"][0]) - 1]
+    figure.add_vline(x=training_end, line_dash="dot", line_color="gray")
+    figure.add_annotation(x=training_end, y=1, yref="paper", text="Training ends", showarrow=False, yanchor="bottom")
+    if view == "Future forecasts":
+        last = prices.index[-1]
+        figure.add_vline(x=last, line_dash="dot", line_color="gray")
+        figure.add_annotation(x=last, y=1, yref="paper", text="Actual prices end", showarrow=False, yanchor="bottom")
+    st.plotly_chart(figure, width="stretch", config={"scrollZoom": True, "displaylogo": False}, key="forecast_plot")
+    st.caption("Drag to zoom, scroll to zoom further, or use the date slider. Double-click to reset; click legend entries to hide or show models.")
+    if include_training:
+        st.caption("Dashed model lines join the last training close as a visual starting point. "
+                   "Each test-day prediction then uses the preceding observed closes; the join is not an extra scored prediction.")
     if view == "Future forecasts":
         last = analysis["test_dates"][-1]
         st.caption(f"Actual prices end {last:%d %b %Y}. Later values are forecasts made with all available history. "
@@ -274,6 +381,7 @@ def show_forecasts(analysis):
         "Direction correct (%)": st.column_config.NumberColumn("Up/down correct (%)", format="%.1f",
                                                                help="The baseline keeps the price unchanged, so it makes no up/down call."),
     })
+    show_equations(analysis, stock)
 
 
 def show_portfolio(analysis):
@@ -281,7 +389,10 @@ def show_portfolio(analysis):
     stocks = ", ".join(analysis["prices"].columns)
     st.caption(f"Portfolio: {stocks}. Starting investment: {analysis['capital']:,.0f}, split equally across the stocks. "
                f"Cost per buy or sell: {analysis['cost_bps'] / 100:.2f}%.")
-    criterion = st.selectbox("Rank model and trading-rule combinations by", list(RANK_BY), key="portfolio_criterion")
+    criterion = st.selectbox("How should we rank the combinations?", list(RANK_BY),
+                             help="Each combination is one model paired with one trading rule. "
+                                  "Ranking changes the winner and the table order, not the results.",
+                             key="portfolio_criterion")
     ranked = rank_combinations(analysis["comparisons"], criterion)
     best = ranked.iloc[0]
     holding = performance_stats(analysis["curves"][best["Trading rule"]]["Buy & hold"])["Net return (%)"]
@@ -297,31 +408,70 @@ def show_portfolio(analysis):
     if ranked["Vs holding (pp)"].max() <= 0:
         st.info("No tested model and trading-rule combination beat simply holding after trading costs.")
 
-    st.markdown("**Top portfolio combinations**")
-    show_comparisons(ranked.head(5))
-    with st.expander(f"All {len(ranked)} portfolio combinations"):
-        show_comparisons(ranked)
-        st.download_button("Download portfolio comparison CSV", ranked.drop(columns="Combination").to_csv(index=False),
-                           file_name="portfolio_comparison.csv", mime="text/csv")
+    st.markdown("**Portfolio combinations**")
+    show_comparisons(ranked)
+    st.download_button("Download portfolio comparison CSV", ranked.drop(columns="Combination").to_csv(index=False),
+                       file_name="portfolio_comparison.csv", mime="text/csv")
 
-    st.markdown("**Compare the models using one trading rule**")
+    st.markdown("**Explore a strategy and compare the models**")
     strategies = list(analysis["curves"])
-    strategy = st.selectbox("Trading rule for the graph", strategies, index=strategies.index(best["Trading rule"]),
+    strategy = st.selectbox("Strategy to explore", strategies, index=strategies.index(best["Trading rule"]),
+                            help="Options are the trading rules selected in Portfolio settings.",
                             key=f"portfolio_strategy_{criterion}")
-    descriptions = {
-        "Buy rises / sell falls": "Each model buys when its next-day forecast is above the latest close and sells into cash when it is below.",
-        "Buy dips / sell rallies": "Each model buys when its next-day forecast is below the latest close and sells into cash when it is above.",
-        "Buy rises / short falls": "Each model buys when its next-day forecast is above the latest close and shorts the stock when it is below.",
-    }
-    st.caption(descriptions[strategy] + " An unchanged forecast leaves the position unchanged.")
+    st.info(STRATEGY_EXPLANATIONS[strategy])
+    st.caption("An unchanged forecast leaves the position unchanged. Each model makes its own decisions for each stock.")
     equity = analysis["curves"][strategy]
-    st.line_chart(equity[["Buy & hold", *analysis["models"]]] * analysis["capital"], y_label="Portfolio value")
+    figure = line_figure(equity[["Buy & hold", *analysis["models"]]] * analysis["capital"], "Portfolio value")
+    st.plotly_chart(figure, width="stretch", config={"scrollZoom": True, "displaylogo": False}, key="portfolio_plot")
     st.caption("Each model trades each stock using that stock's own forecast. All curves start with the same investment; "
                "buy & hold buys at the start and keeps the stocks. This is historical test performance, not projected future profit.")
 
+    with st.expander("Advanced: how each stock contributed"):
+        st.caption("Every stock starts with an equal share of the portfolio, and the portfolio return is the average of the "
+                   "stocks' returns. A stock's contribution is its own return divided by the number of stocks, so the "
+                   "contributions add up to the portfolio return. Contributions are in percentage points of the starting investment.")
+        model = st.selectbox("Model to break down", analysis["models"], key=f"contrib_model_{strategy}")
+        count = len(analysis["prices"].columns)
+        breakdown = pd.DataFrame([
+            {
+                "Stock": stock,
+                "Model return (%)": (equity[model].iloc[-1] - 1) * 100,
+                "Portfolio contribution (pp)": (equity[model].iloc[-1] - 1) / count * 100,
+                "Buy & hold return (%)": (equity["Buy & hold"].iloc[-1] - 1) * 100,
+                "Buy & hold contribution (pp)": (equity["Buy & hold"].iloc[-1] - 1) / count * 100,
+            }
+            for stock, equity in analysis["stock_curves"][strategy].items()
+        ])
+        breakdown["Edge vs holding (pp)"] = (breakdown["Portfolio contribution (pp)"]
+                                             - breakdown["Buy & hold contribution (pp)"])
+        curve = analysis["curves"][strategy]
+        total = {
+            "Stock": "Total (portfolio)",
+            "Model return (%)": (curve[model].iloc[-1] - 1) * 100,
+            "Portfolio contribution (pp)": breakdown["Portfolio contribution (pp)"].sum(),
+            "Buy & hold return (%)": (curve["Buy & hold"].iloc[-1] - 1) * 100,
+            "Buy & hold contribution (pp)": breakdown["Buy & hold contribution (pp)"].sum(),
+            "Edge vs holding (pp)": breakdown["Edge vs holding (pp)"].sum(),
+        }
+        display = pd.concat([breakdown, pd.DataFrame([total])], ignore_index=True)
+        st.dataframe(display, hide_index=True, width="stretch",
+                     column_config={column: st.column_config.NumberColumn(format="%.2f")
+                                    for column in display.columns[1:]})
+        bars = breakdown.melt(
+            id_vars="Stock",
+            value_vars=["Portfolio contribution (pp)", "Buy & hold contribution (pp)"],
+            var_name="Measure", value_name="Percentage points",
+        )
+        figure = px.bar(bars, x="Stock", y="Percentage points", color="Measure", barmode="group",
+                        labels={"Measure": ""})
+        figure.update_layout(height=360, legend_title_text="")
+        st.plotly_chart(figure, width="stretch", config={"displaylogo": False}, key=f"contrib_plot_{strategy}_{model}")
+        st.caption("A positive contribution added to the portfolio return; a negative contribution reduced it. "
+                   "The edge column shows how much the model's strategy added or lost versus simply holding that stock.")
+
 
 def main():
-    st.set_page_config(page_title="Stock Forecaster", layout="wide")
+    st.set_page_config(page_title="Stock Forecaster", page_icon="capybara.png", layout="wide")
     st.title("Stock Forecaster")
     st.caption("Compare next-day price predictions, then explore what happens when a portfolio trades on those predictions.")
 
@@ -387,6 +537,8 @@ def main():
             "- Portfolio sleeves receive equal starting capital and trade independently; weights can drift. Cash earns 0%. "
             "Closing-price fills are hypothetical. Costs apply on position changes; open positions are valued, not liquidated, at the end. "
             "Taxes, intraday slippage and short-borrow/margin costs are excluded.\n"
+            "- Each stock's contribution is its own return divided by the number of stocks, so contributions add up to the portfolio return. "
+            "The edge column compares each stock's contribution with simply holding that stock.\n"
             "- These rankings select a winner on the displayed test data; independent validation is needed to assess the selected winner.\n\n"
             "References: Hyndman & Athanasopoulos, [forecast benchmarks and accuracy](https://otexts.com/fpp3/toolbox.html#sec-accuracy); "
             "Sharpe (1994), [The Sharpe Ratio](https://web.stanford.edu/~wfsharpe/art/sr/SR.htm)."

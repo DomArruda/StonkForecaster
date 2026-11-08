@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.5.4",
     "pandas>=3.1.1",
+    "plotly>=7.1.0",
     "scikit-learn>=1.9.1",
     "streamlit>=1.67.0",
     "xgboost>=3.4.1",

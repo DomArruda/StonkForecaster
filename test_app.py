@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from PIL import Image
 from streamlit.testing.v1 import AppTest
 
 import app
@@ -20,6 +21,9 @@ class IdentityScale:
 
 
 def check():
+    icon = Image.open(Path(__file__).with_name("capybara.png"))
+    assert icon.size == (256, 256) and icon.mode == "RGBA"
+
     # Repeated next-day forecasts must keep the same feature order as training.
     np.testing.assert_allclose(
         app.forecast_next_days(LatestClosePlusOne(), IdentityScale(), pd.Series([20, 30, 40, 50, 60]), 3),
@@ -82,6 +86,11 @@ def check():
         stock_curves = {t: app.strategy_equity(analysis["prices"][t], analysis["forecasts"][t],
                                              app.STRATEGIES[strategy], 10) for t in analysis["prices"]}
         np.testing.assert_allclose(curves, (stock_curves["ONE"] + stock_curves["TWO"]) / 2)
+        # Equal-weight contribution decomposition must sum to the portfolio return.
+        assert set(analysis["stock_curves"][strategy]) == set(analysis["prices"])
+        for model in [*models, "Buy & hold"]:
+            contributions = sum(eq[model].iloc[-1] - 1 for eq in analysis["stock_curves"][strategy].values()) / 2
+            np.testing.assert_allclose(contributions, curves[model].iloc[-1] - 1)
     for stock in analysis["prices"]:
         accuracy = analysis["accuracy"][stock]
         assert len(accuracy) == len(models)
@@ -96,6 +105,23 @@ def check():
         future = app.forecast_lines(analysis, stock, models, include_future=True)
         assert future.index[-1] > test_dates[-1]
         assert future.loc[future.index > test_dates[-1], "Actual"].isna().all()
+
+    # Fitted equations must reproduce the final refit's first recursive forecast.
+    for model in ["Linear Regression", "Ridge Regression", "Lasso Regression"]:
+        result = analysis["forecasts"]["ONE"][model]
+        intercept, coefficients = app.linear_equation(result)
+        features = analysis["prices"]["ONE"].iloc[-app.LAGS:].to_numpy()[::-1]
+        np.testing.assert_allclose(intercept + coefficients @ features,
+                                   result["future"].iloc[0], rtol=1e-9, atol=1e-9)
+    xgb = analysis["forecasts"]["ONE"]["XGBoost"]["model"][-1]
+    trees = xgb.get_booster().trees_to_dataframe()
+    assert not trees.empty and trees["Tree"].nunique() >= 1
+    raw_features = set(trees["Feature"].dropna()) - {"Leaf"}
+    assert raw_features <= ({f"f{i}" for i in range(app.LAGS)}
+                            | {f"lag_{i}" for i in range(1, app.LAGS + 1)})
+    neural = analysis["forecasts"]["ONE"]["Neural Network"]["model"][-1]
+    assert neural.n_features_in_ == app.LAGS and neural.hidden_layer_sizes == (32,)
+    assert sum(w.size for w in neural.coefs_) + sum(b.size for b in neural.intercepts_) > 0
 
     # Changing held-out prices cannot change the first forecast; it should change refitted futures.
     before = app.compute_results(one, ["Linear Regression"], 3, 0.8)
@@ -115,18 +141,23 @@ def check():
             patch("sklearn.pipeline.Pipeline.fit", side_effect=AssertionError("A graph change retrained a model")):
         ui.run()
         assert not ui.exception and not ui.error
-        assert len(ui.metric) == 7 and len(ui.dataframe) == 3
+        assert len(ui.metric) == 7 and len(ui.dataframe) == 4
+        assert len(ui.get("latex")) == 3
         tabs = ui.get("tab")
         assert [tab.label for tab in tabs] == ["1. Forecast comparison", "2. Portfolio strategies"]
-        assert all(sum(e.type.endswith("vega_lite_chart") for e in tab) == 1 for tab in tabs)
-        finance_before = ui.dataframe[1].value.copy()
+        assert sum(e.type.endswith("plotly_chart") for e in tabs[0]) == 1
+        assert sum(e.type.endswith("plotly_chart") for e in tabs[1]) == 2
+        finance_before = ui.dataframe[2].value.copy()
         for stock in analysis["prices"]:
             ui.selectbox(key="forecast_stock").select(stock).run()
-            pd.testing.assert_frame_equal(finance_before, ui.dataframe[1].value)
+            pd.testing.assert_frame_equal(finance_before, ui.dataframe[2].value)
             for view in ui.selectbox(key="forecast_view").options:
                 ui.selectbox(key="forecast_view").select(view).run()
                 assert not ui.exception and not ui.error
-                assert sum(e.type.endswith("vega_lite_chart") for e in ui) == 2
+                assert sum(e.type.endswith("plotly_chart") for e in ui) == 3
+                ui.checkbox(key="show_training").check().run()
+                assert not ui.exception and not ui.error
+                ui.checkbox(key="show_training").uncheck().run()
         for criterion in app.RANK_BY:
             forecast_before = ui.dataframe[0].value.copy()
             ui.selectbox(key="portfolio_criterion").select(criterion).run()
@@ -137,6 +168,14 @@ def check():
             for strategy in strategies:
                 ui.selectbox(key=strategy_key).select(strategy).run()
                 assert not ui.exception and not ui.error
+                for model in models:
+                    ui.selectbox(key=f"contrib_model_{strategy}").select(model).run()
+                    assert not ui.exception and not ui.error
+                    table = ui.dataframe[3].value
+                    expected = (analysis["curves"][strategy][model].iloc[-1] - 1) * 100
+                    assert abs(table.iloc[-1]["Portfolio contribution (pp)"] - expected) < 1e-9
+                    assert abs(table.iloc[:-1]["Portfolio contribution (pp)"].sum() - expected) < 1e-9
+                assert ui.dataframe[3].value.iloc[-1]["Stock"] == "Total (portfolio)"
         text = " ".join(e.value for kind in ("caption", "markdown", "subheader") for e in ui.get(kind))
         assert "recursive" not in text.lower() and "date features" not in text.lower()
         assert [m.label for m in ui.sidebar.multiselect] == ["Models to compare", "Trading rules"]
