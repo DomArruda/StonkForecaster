@@ -20,7 +20,7 @@ MODEL_FACTORIES = {
 }
 STRATEGIES = {
     "Buy rises / sell falls": lambda r: np.where(r > 0, 1.0, np.where(r < 0, 0.0, np.nan)),
-    "Buy dips / sell rallies": lambda r: np.where(r < 0, 1.0, np.where(r > 0, 0.0, np.nan)),
+    "Only strong signals (1% band)": lambda r: np.where(r > 0.01, 1.0, np.where(r < -0.01, 0.0, np.nan)),
     "Buy rises / short falls": lambda r: np.where(r > 0, 1.0, np.where(r < 0, -1.0, np.nan)),
 }
 STRATEGY_EXPLANATIONS = {
@@ -28,10 +28,10 @@ STRATEGY_EXPLANATIONS = {
         "**Follow the forecast.** Buy or keep the stock when the model predicts a next-day price above the latest close. "
         "Sell into cash when it predicts a lower price. Cash earns 0% in this comparison."
     ),
-    "Buy dips / sell rallies": (
-        "**Go against the forecast (contrarian).** Buy when the model predicts a lower next-day price; "
-        "sell into cash when it predicts a higher price. This deliberately trades against the model's predicted direction, "
-        "rather than buying at an observed future low."
+    "Only strong signals (1% band)": (
+        "**Trade only on clear forecasts.** Buy when the model predicts a next-day gain above 1%; "
+        "sell into cash when it predicts a loss below −1%. If the forecast is between −1% and +1%, "
+        "keep the current position. Ignoring small signals means fewer trades and lower costs."
     ),
     "Buy rises / short falls": (
         "**Follow the forecast with shorting.** Buy when the model predicts a higher next-day price and "
@@ -39,11 +39,11 @@ STRATEGY_EXPLANATIONS = {
         "losses when it rises. Short-borrow and margin costs are excluded here."
     ),
 }
-RANK_BY = {
-    "Return above buy & hold": ("Vs holding (pp)", False),
-    "Risk-adjusted return (Sharpe)": ("Sharpe", False),
-    "Smallest decline from peak": ("Largest decline (%)", True),
-}
+BUY_AND_HOLD = (
+    "**Buy & hold (baseline).** Invest the starting amount equally across the stocks at the start, then keep them "
+    "for the whole test period. It uses no forecasts and makes no later trades, so every strategy is judged by "
+    "whether it beats this simple approach."
+)
 LAGS = 5
 
 
@@ -219,11 +219,10 @@ def analyze(closes, models, strategies, steps, split, cost_bps, capital):
     }
 
 
-def rank_combinations(comparisons, criterion):
-    column, ascending = RANK_BY[criterion]
+def rank_combinations(comparisons):
     ranked = comparisons.sort_values(
-        [column, "Net return (%)", "Combination"],
-        ascending=[ascending, False, True], na_position="last", kind="stable",
+        ["Vs holding (pp)", "Net return (%)", "Combination"],
+        ascending=[False, False, True], na_position="last", kind="stable",
     ).reset_index(drop=True)
     ranked.insert(0, "Rank", np.arange(1, len(ranked) + 1))
     return ranked
@@ -281,7 +280,7 @@ def equation_latex(intercept, coefficients):
 
 
 def show_equations(analysis, stock):
-    with st.expander("Model equations (fitted on all available history)"):
+    with st.expander("Model equations — click to open"):
         st.caption("Coefficients are converted back to original price units. The final refit produces the future forecasts; "
                    "test-day accuracy uses the earlier training fit. lag_1 is yesterday's close; lag_5 is five sessions ago.")
         for model in analysis["models"]:
@@ -319,7 +318,7 @@ def show_comparisons(ranked):
                "Largest decline (%)", "Sharpe"]
     config = {
         "Net return (%)": st.column_config.NumberColumn("Portfolio return (%)", format="%.2f"),
-        "Vs holding (pp)": st.column_config.NumberColumn("Above holding (points)", format="%.2f",
+        "Vs holding (pp)": st.column_config.NumberColumn("Above buy & hold (points)", format="%.2f",
                                                         help="Difference in percentage points, not a relative percentage gain."),
         "Largest decline (%)": st.column_config.NumberColumn("Biggest fall (%)", format="%.2f"),
         "Sharpe": st.column_config.NumberColumn("Sharpe", format="%.2f", help="Return relative to day-to-day risk. Higher is better."),
@@ -388,17 +387,13 @@ def show_portfolio(analysis):
     st.subheader("Do the forecasts improve portfolio returns?")
     stocks = ", ".join(analysis["prices"].columns)
     st.caption(f"Portfolio: {stocks}. Starting investment: {analysis['capital']:,.0f}, split equally across the stocks. "
-               f"Cost per buy or sell: {analysis['cost_bps'] / 100:.2f}%.")
-    criterion = st.selectbox("How should we rank the combinations?", list(RANK_BY),
-                             help="Each combination is one model paired with one trading rule. "
-                                  "Ranking changes the winner and the table order, not the results.",
-                             key="portfolio_criterion")
-    ranked = rank_combinations(analysis["comparisons"], criterion)
+               f"Cost per buy or sell: {analysis['cost_bps'] / 100:.2f}%. The baseline is buy & hold: buy at the start and keep the stocks.")
+    ranked = rank_combinations(analysis["comparisons"])
     best = ranked.iloc[0]
     holding = performance_stats(analysis["curves"][best["Trading rule"]]["Buy & hold"])["Net return (%)"]
     st.markdown(f"**Best combination in this backtest: {best['Model']} · {best['Trading rule']}**")
     a, b, c, d = st.columns(4)
-    a.metric("Portfolio return", f"{best['Net return (%)']:+.2f}%", f"{best['Vs holding (pp)']:+.2f} points vs holding")
+    a.metric("Portfolio return", f"{best['Net return (%)']:+.2f}%", f"{best['Vs holding (pp)']:+.2f} points vs buy & hold")
     b.metric("Buy & hold return", f"{holding:+.2f}%")
     c.metric("Biggest fall from a peak", f"{best['Largest decline (%)']:.2f}%")
     d.metric("Sharpe ratio", "—" if pd.isna(best["Sharpe"]) else f"{best['Sharpe']:.2f}",
@@ -406,9 +401,9 @@ def show_portfolio(analysis):
     st.caption("These results use the same test-day forecasts shown in Forecast comparison. "
                "The most accurate price model may not produce the best trading return.")
     if ranked["Vs holding (pp)"].max() <= 0:
-        st.info("No tested model and trading-rule combination beat simply holding after trading costs.")
+        st.info("No tested model and trading-rule combination beat buy & hold after trading costs.")
 
-    st.markdown("**Portfolio combinations**")
+    st.markdown("**Portfolio combinations — ranked by return above buy & hold**")
     show_comparisons(ranked)
     st.download_button("Download portfolio comparison CSV", ranked.drop(columns="Combination").to_csv(index=False),
                        file_name="portfolio_comparison.csv", mime="text/csv")
@@ -417,8 +412,8 @@ def show_portfolio(analysis):
     strategies = list(analysis["curves"])
     strategy = st.selectbox("Strategy to explore", strategies, index=strategies.index(best["Trading rule"]),
                             help="Options are the trading rules selected in Portfolio settings.",
-                            key=f"portfolio_strategy_{criterion}")
-    st.info(STRATEGY_EXPLANATIONS[strategy])
+                            key="portfolio_strategy")
+    st.info(STRATEGY_EXPLANATIONS[strategy] + "\n\n" + BUY_AND_HOLD)
     st.caption("An unchanged forecast leaves the position unchanged. Each model makes its own decisions for each stock.")
     equity = analysis["curves"][strategy]
     figure = line_figure(equity[["Buy & hold", *analysis["models"]]] * analysis["capital"], "Portfolio value")
@@ -426,7 +421,7 @@ def show_portfolio(analysis):
     st.caption("Each model trades each stock using that stock's own forecast. All curves start with the same investment; "
                "buy & hold buys at the start and keeps the stocks. This is historical test performance, not projected future profit.")
 
-    with st.expander("Advanced: how each stock contributed"):
+    with st.expander("Advanced: how each stock contributed — click to open"):
         st.caption("Every stock starts with an equal share of the portfolio, and the portfolio return is the average of the "
                    "stocks' returns. A stock's contribution is its own return divided by the number of stocks, so the "
                    "contributions add up to the portfolio return. Contributions are in percentage points of the starting investment.")
@@ -485,7 +480,7 @@ def main():
         split = st.slider("Earlier history used to learn (%)", 50, 95, 80,
                           help="The remaining, later days test predictions against actual prices.") / 100
         with st.expander("Portfolio settings"):
-            strategies = st.multiselect("Trading rules", list(STRATEGIES), default=list(STRATEGIES)[:2],
+            strategies = st.multiselect("Trading rules", list(STRATEGIES), default=list(STRATEGIES)[:1],
                                        help="Each rule uses each model's own next-day forecast. Selling means cash unless shorting is selected.")
             capital = st.number_input("Starting investment", min_value=100.0, value=10000.0, step=100.0)
             cost_percent = st.number_input("Cost per buy or sell (%)", 0.0, 1.0, 0.10, 0.01,
@@ -524,9 +519,9 @@ def main():
     with portfolio_tab:
         show_portfolio(analysis)
 
-    with st.expander("How to read these results · methodology & references"):
+    with st.expander("How to read these results — click to open"):
         st.markdown(
-            "- **Net return** is the test-period gain after modeled trading costs. **Vs holding** is the difference in percentage points.\n"
+            "- **Net return** is the test-period gain after modeled trading costs. **Above buy & hold** is the difference in percentage points.\n"
             "- **Largest decline** is the maximum drawdown, including the initial investment. Lower is better.\n"
             "- **Sharpe** uses daily net returns, a 0% risk-free rate and 252 sessions per year; zero volatility displays as unavailable.\n"
             "- **Forecast error** is MAPE; **direction correct** compares the predicted and actual move from the preceding close. "
@@ -539,7 +534,8 @@ def main():
             "Taxes, intraday slippage and short-borrow/margin costs are excluded.\n"
             "- Each stock's contribution is its own return divided by the number of stocks, so contributions add up to the portfolio return. "
             "The edge column compares each stock's contribution with simply holding that stock.\n"
-            "- These rankings select a winner on the displayed test data; independent validation is needed to assess the selected winner.\n\n"
+            "- The table is ranked by return above buy & hold. This selects a winner on the displayed test data; "
+            "independent validation is needed to assess the selected winner.\n\n"
             "References: Hyndman & Athanasopoulos, [forecast benchmarks and accuracy](https://otexts.com/fpp3/toolbox.html#sec-accuracy); "
             "Sharpe (1994), [The Sharpe Ratio](https://web.stanford.edu/~wfsharpe/art/sr/SR.htm)."
         )

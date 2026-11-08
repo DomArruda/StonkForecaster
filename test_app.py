@@ -72,10 +72,12 @@ def check():
     comparisons = analysis["comparisons"]
     assert len(comparisons) == len(models) * len(strategies)
     assert "Method" not in comparisons and "Forecast error (%)" not in comparisons
-    for criterion, (column, ascending) in app.RANK_BY.items():
-        ranked = app.rank_combinations(comparisons, criterion)
-        values = ranked[column].dropna()
-        assert values.is_monotonic_increasing if ascending else values.is_monotonic_decreasing
+    assert "Buy dips / sell rallies" not in app.STRATEGIES
+    ranked = app.rank_combinations(comparisons)
+    assert ranked["Vs holding (pp)"].is_monotonic_decreasing
+    assert ranked["Rank"].tolist() == list(range(1, len(ranked) + 1))
+    strong = app.STRATEGIES["Only strong signals (1% band)"](pd.Series([0.02, 0.0, -0.02]))
+    assert strong[0] == 1 and np.isnan(strong[1]) and strong[2] == 0
     reference_hold = None
     for strategy, curves in analysis["curves"].items():
         assert curves.index[1:].equals(test_dates)
@@ -158,26 +160,22 @@ def check():
                 ui.checkbox(key="show_training").check().run()
                 assert not ui.exception and not ui.error
                 ui.checkbox(key="show_training").uncheck().run()
-        for criterion in app.RANK_BY:
-            forecast_before = ui.dataframe[0].value.copy()
-            ui.selectbox(key="portfolio_criterion").select(criterion).run()
-            pd.testing.assert_frame_equal(forecast_before, ui.dataframe[0].value)
-            winner = app.rank_combinations(comparisons, criterion).iloc[0]
-            strategy_key = f"portfolio_strategy_{criterion}"
-            assert ui.selectbox(key=strategy_key).value == winner["Trading rule"]
-            for strategy in strategies:
-                ui.selectbox(key=strategy_key).select(strategy).run()
+        winner = app.rank_combinations(comparisons).iloc[0]
+        assert ui.selectbox(key="portfolio_strategy").value == winner["Trading rule"]
+        for strategy in strategies:
+            ui.selectbox(key="portfolio_strategy").select(strategy).run()
+            assert not ui.exception and not ui.error
+            for model in models:
+                ui.selectbox(key=f"contrib_model_{strategy}").select(model).run()
                 assert not ui.exception and not ui.error
-                for model in models:
-                    ui.selectbox(key=f"contrib_model_{strategy}").select(model).run()
-                    assert not ui.exception and not ui.error
-                    table = ui.dataframe[3].value
-                    expected = (analysis["curves"][strategy][model].iloc[-1] - 1) * 100
-                    assert abs(table.iloc[-1]["Portfolio contribution (pp)"] - expected) < 1e-9
-                    assert abs(table.iloc[:-1]["Portfolio contribution (pp)"].sum() - expected) < 1e-9
-                assert ui.dataframe[3].value.iloc[-1]["Stock"] == "Total (portfolio)"
+                table = ui.dataframe[3].value
+                expected = (analysis["curves"][strategy][model].iloc[-1] - 1) * 100
+                assert abs(table.iloc[-1]["Portfolio contribution (pp)"] - expected) < 1e-9
+                assert abs(table.iloc[:-1]["Portfolio contribution (pp)"].sum() - expected) < 1e-9
+            assert ui.dataframe[3].value.iloc[-1]["Stock"] == "Total (portfolio)"
         text = " ".join(e.value for kind in ("caption", "markdown", "subheader") for e in ui.get(kind))
         assert "recursive" not in text.lower() and "date features" not in text.lower()
+        assert "contrarian" not in text.lower()
         assert [m.label for m in ui.sidebar.multiselect] == ["Models to compare", "Trading rules"]
 
     # Submit the actual form, including duplicate/invalid tickers and yfinance's ticker-first columns.
@@ -190,7 +188,7 @@ def check():
         fresh.sidebar.button[0].click().run()
         assert not fresh.exception and not fresh.error
         assert fresh.session_state["comparison"]["missing"] == ["BAD"]
-        assert len(fresh.session_state["comparison"]["comparisons"]) == 15
+        assert len(fresh.session_state["comparison"]["comparisons"]) == len(models) * len(strategies)
         assert fresh.session_state["comparison"]["cost_bps"] == 10
         assert download.call_args.args[0] == ["ONE", "TWO", "BAD"]
         assert download.call_args.kwargs["end"] == app.date.today() + app.timedelta(days=1)

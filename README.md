@@ -20,11 +20,13 @@ python -m uv run streamlit run app.py
    Expand **Model equations** to see each fitted model: the price equation for linear, ridge, and lasso,
    the highest-gain XGBoost tree, and the neural-network architecture.
 3. **Portfolio strategies:** each model manages the same equal-starting-allocation portfolio using
-   each stock's own forecast. Compare returns against buy & hold; **Strategy to explore** explains
-   the selected rule in plain language and displays its results for all models.
-4. The portfolio comparison lists every model/rule combination once; download it as a CSV.
-   **Advanced: how each stock contributed** decomposes a chosen model's portfolio return into
-   per-stock contributions (percentage points) and compares each with buy & hold. Contributions
+   each stock's own forecast. The default rule buys when the forecast predicts a higher next-day price
+   and sells into cash when it predicts a lower price. Optional rules trade only on strong forecasts
+   (1% band) or also short predicted falls. **Strategy to explore** explains the selected rule and
+   describes **buy & hold** — the baseline that buys at the start and keeps the stocks.
+4. The portfolio comparison lists every model/rule combination once, ranked by return above buy & hold;
+   download it as a CSV. **Advanced: how each stock contributed** decomposes a chosen model's portfolio
+   return into per-stock contributions (percentage points) and compares each with buy & hold. Contributions
    sum to the portfolio return because every stock starts with an equal share.
 
 Charts use Plotly: drag or scroll to zoom, pan with the toolbar, or adjust the date slider.
@@ -34,7 +36,7 @@ Every model uses the five preceding observed closes and the same chronological t
 Predictions for a session target its close using earlier observations. Future forecasts are refitted
 on all available history, then repeat next-day predictions using their own predicted prices. The portfolio
 has equal starting allocations; the modeled trade cost also applies to buy & hold's initial purchase.
-“Best” means best on the displayed test period under the selected ranking criterion.
+“Best” means best on the displayed test period by return above buy & hold.
 Future dates use weekdays and do not exclude exchange holidays.
 The training-history join is a visual anchor, not an additional scored prediction. Test-day forecasts
 still use observed prices from preceding days; future forecasts use their own preceding predictions.
